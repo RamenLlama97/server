@@ -202,7 +202,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialDevice *data.Device, user *data.User, ackCh <-chan WSMessage, broadcastCh <-chan any, stopCh <-chan struct{}) {
-	var pendingImage []byte
 	device := *initialDevice
 	lastSentBrightness := -1
 	sendImmediate := false
@@ -217,46 +216,41 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 		// Calculate effective brightness
 		effectiveBrightness := device.GetEffectiveBrightness()
 
-		// 1. Get Next Image
-		var imgData []byte
-		var app *data.App
-		var err error
+		// 1. Get Next Image (transient push queue first, then rotation)
+		imgData, app, err := s.GetNextAppImage(ctx, &device, user)
+		if err != nil {
+			slog.Error("Failed to get next app", "error", err)
 
-		if pendingImage != nil {
-			imgData = pendingImage
-			pendingImage = nil
-		} else {
-			imgData, app, err = s.GetNextAppImage(ctx, &device, user)
-			if err != nil {
-				slog.Error("Failed to get next app", "error", err)
-
-				// Wait for update or timeout before retrying
-				timer := time.NewTimer(5 * time.Second)
-				select {
-				case <-broadcastCh:
-					// Update available - reload device
-					reloadedDevice, err := s.reloadDevice(initialDevice.ID)
-					if err != nil {
-						slog.Error("Device gone", "id", initialDevice.ID, "error", err)
-						return
-					}
-					device = *reloadedDevice
-				case <-timer.C:
-					// Timeout - reload device just in case we missed something
-					reloadedDevice, err := s.reloadDevice(initialDevice.ID)
-					if err != nil {
-						slog.Error("Device gone", "id", initialDevice.ID, "error", err)
-						return
-					}
-					device = *reloadedDevice
-				case <-stopCh:
-					timer.Stop()
+			// Wait for update or timeout before retrying
+			timer := time.NewTimer(5 * time.Second)
+			select {
+			case <-broadcastCh:
+				// Update available - reload device
+				reloadedDevice, err := s.reloadDevice(initialDevice.ID)
+				if err != nil {
+					slog.Error("Device gone", "id", initialDevice.ID, "error", err)
 					return
 				}
+				device = *reloadedDevice
+			case <-timer.C:
+				// Timeout - reload device just in case we missed something
+				reloadedDevice, err := s.reloadDevice(initialDevice.ID)
+				if err != nil {
+					slog.Error("Device gone", "id", initialDevice.ID, "error", err)
+					return
+				}
+				device = *reloadedDevice
+			case <-stopCh:
 				timer.Stop()
-				continue
+				return
 			}
+			timer.Stop()
+			continue
 		}
+
+		// A transient (queued) pushed image has an empty Iname. A queue:true append
+		// must not cut such an image short, but a queue:false (supersede) push may.
+		currentIsQueued := app != nil && app.Pushed && app.Iname == ""
 
 		dwell := device.GetEffectiveDwellTime(app)
 
@@ -312,8 +306,9 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 					// we accept any ACK as confirmation that the device received and processed our message.
 					waiting = false
 
-					// Update DisplayingApp confirmation in DB
-					if app != nil {
+					// Update DisplayingApp confirmation in DB (skip transient pushed images,
+					// which use a synthetic app with an empty Iname).
+					if app != nil && app.Iname != "" {
 						slog.Debug("Received ACK, updating DisplayingApp", "app", app.Iname, "device", device.ID)
 						// Only now do we update the database that the device is truly displaying this app.
 						if _, err := gorm.G[data.Device](s.DB).Where("id = ?", device.ID).Update(ctx, "displaying_app", app.Iname); err != nil {
@@ -322,7 +317,7 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 						// Notify Dashboard
 						s.notifyDashboard(user.Username, WSEvent{Type: "image_updated", DeviceID: device.ID})
 					} else {
-						slog.Debug("Received ACK for default or pushed image (no app context)", "device", device.ID)
+						slog.Debug("Received ACK for default or transient pushed image (no app context)", "device", device.ID)
 					}
 				}
 				// If just Queued, we keep waiting for Displaying.
@@ -335,40 +330,28 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 				}
 				device = reloaded
 
-				var isCommand bool
-				var isImage bool
-				var cmdPayload []byte
-				var imgData []byte
-
 				switch v := val.(type) {
 				case DeviceCommandMessage:
-					isCommand = true
-					cmdPayload = v.Payload
-				case []byte:
-					if len(v) > 0 {
-						isImage = true
-						imgData = v
-					}
-				}
-
-				if isCommand {
-					// It's a command, send it directly as JSON (TextMessage)
-					if err := conn.WriteMessage(websocket.TextMessage, cmdPayload); err != nil {
+					// It's a command, send it directly as JSON (TextMessage).
+					// Don't interrupt the current app for settings changes, unless it's a reboot (which the device handles).
+					if err := conn.WriteMessage(websocket.TextMessage, v.Payload); err != nil {
 						slog.Error("Failed to write command to WS", "error", err)
 						return
 					}
-					// Don't interrupt the current app for settings changes, unless it's a reboot (which the device handles)
 					continue
-				}
-
-				if isImage {
-					// Pushed Image: Interrupt and send
-					pendingImage = imgData
-					interrupted = true
-					waiting = false
-					sendImmediate = true
-				} else {
-					// State Change: Update Brightness immediately, but don't interrupt current app
+				case QueueChanged:
+					// The transient push queue changed. Interrupt the current display when a
+					// supersede (queue:false) push arrived, or when an image is pending and the
+					// current display is rotation/default (preempt it). A queued image already
+					// showing is left to finish; the next loop iteration drains the next item.
+					interruptFlag, pending := s.pushQueueState(device.ID, true)
+					if interruptFlag || (!currentIsQueued && pending) {
+						interrupted = true
+						waiting = false
+						sendImmediate = true
+					}
+				default:
+					// State Change (e.g. brightness): update immediately, but don't interrupt current app
 					newBrightness := device.GetEffectiveBrightness()
 
 					if newBrightness != lastSentBrightness {

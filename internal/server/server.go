@@ -58,6 +58,11 @@ type Server struct {
 	// fetched in get_schema) can be refreshed before the app's TTL expires.
 	SchemaCache SchemaCacheBypasser
 
+	// pushQueues holds transient (one-shot) pushed images per device, drained by
+	// GetNextAppImage. See push_queue.go.
+	pushQueues     map[string]*deviceQueue
+	pushQueueMutex sync.Mutex
+
 	UpdateAvailable  bool
 	LatestReleaseURL string
 }
@@ -105,6 +110,7 @@ func NewServer(db *gorm.DB, cfg *config.Settings) *Server {
 		},
 		PromRegistry: prometheus.DefaultRegisterer,
 		PromGatherer: prometheus.DefaultGatherer,
+		pushQueues:   make(map[string]*deviceQueue),
 	}
 
 	// Load Settings from DB

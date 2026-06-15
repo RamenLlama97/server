@@ -741,8 +741,10 @@ func (s *Server) handlePushPreview(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Image not found", http.StatusNotFound)
 			return
 		}
-		// Notify device via Websocket (Broadcaster) - no need to re-save, image already exists
-		s.Broadcaster.Notify(device.ID, imgBytes)
+		// Show on device now via the transient push queue (supersede) - no need to
+		// re-save, the image already exists.
+		s.enqueuePush(device.ID, imgBytes, 0, true, "")
+		s.Broadcaster.Notify(device.ID, QueueChanged{})
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -780,13 +782,14 @@ func (s *Server) handlePushPreview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Push preview image to device (ephemeral)
-	if err := s.savePushedImage(device.ID, app.Iname, "", imgBytes); err != nil {
+	if err := s.savePushedImage(device.ID, app.Iname, imgBytes); err != nil {
 		http.Error(w, "Failed to push preview", http.StatusInternalServerError)
 		return
 	}
 
-	// Notify device via Websocket (Broadcaster)
-	s.Broadcaster.Notify(device.ID, imgBytes)
+	// Show on device now via the transient push queue (supersede).
+	s.enqueuePush(device.ID, imgBytes, 0, true, "")
+	s.Broadcaster.Notify(device.ID, QueueChanged{})
 
 	w.WriteHeader(http.StatusOK)
 }

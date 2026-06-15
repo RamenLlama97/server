@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -1221,172 +1220,6 @@ func TestHandleRebootDeviceAPI(t *testing.T) {
 	}
 }
 
-func TestSavePushedImage_CoalesceID(t *testing.T) {
-	s := newTestServerAPI(t)
-	deviceID := "testdevice"
-
-	pushedDir := filepath.Join(s.DataDir, "webp", deviceID, "pushed")
-
-	// Save 5 coalesced pushes with the same coalesceID — only 1 should remain
-	for i := range 5 {
-		imgData := fmt.Appendf(nil, "coalesced image %d", i)
-		if err := s.savePushedImage(deviceID, "", "mycoalesce", imgData); err != nil {
-			t.Fatalf("Failed to save coalesced push %d: %v", i, err)
-		}
-		time.Sleep(1 * time.Millisecond)
-	}
-
-	entries, err := os.ReadDir(pushedDir)
-	if err != nil {
-		t.Fatalf("Failed to read pushed dir: %v", err)
-	}
-
-	// With coalesceID, at most 1 file with that ID (__{timestamp}_{coalesceID}.webp)
-	coalescedCount := 0
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), "__") && strings.HasSuffix(entry.Name(), "_mycoalesce.webp") {
-			coalescedCount++
-		}
-	}
-	if coalescedCount != 1 {
-		t.Errorf("Expected 1 coalesced file, got %d: %v", coalescedCount, entryNames(pushedDir))
-	}
-}
-
-func TestSavePushedImage_CoalesceID_SuffixCollision(t *testing.T) {
-	s := newTestServerAPI(t)
-	deviceID := "testdevice-collision"
-	pushedDir := filepath.Join(s.DataDir, "webp", deviceID, "pushed")
-
-	// Save with coalesceID "foo"
-	if err := s.savePushedImage(deviceID, "", "foo", []byte("foo")); err != nil {
-		t.Fatalf("Failed to save with coalesceID 'foo': %v", err)
-	}
-	// Save with coalesceID "bar_foo" (must not collide with "foo")
-	if err := s.savePushedImage(deviceID, "", "bar_foo", []byte("bar_foo")); err != nil {
-		t.Fatalf("Failed to save with coalesceID 'bar_foo': %v", err)
-	}
-
-	entries, err := os.ReadDir(pushedDir)
-	if err != nil {
-		t.Fatalf("Failed to read pushed dir: %v", err)
-	}
-
-	// Both files should exist — "bar_foo" must not have deleted "foo"'s file.
-	// Extract coalesceID from filenames properly (split at first _ after __).
-	fooCount := 0
-	barFooCount := 0
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasPrefix(name, "__") && strings.HasSuffix(name, ".webp") {
-			inner := name[2 : len(name)-5]
-			if _, fileCoalesceID, found := strings.Cut(inner, "_"); found {
-				switch fileCoalesceID {
-				case "foo":
-					fooCount++
-				case "bar_foo":
-					barFooCount++
-				}
-			}
-		}
-	}
-	if fooCount != 1 {
-		t.Errorf("Expected 1 file for coalesceID 'foo', got %d: %v", fooCount, entryNames(pushedDir))
-	}
-	if barFooCount != 1 {
-		t.Errorf("Expected 1 file for coalesceID 'bar_foo', got %d: %v", barFooCount, entryNames(pushedDir))
-	}
-}
-
-func TestSavePushedImage_AnonymousExpiry(t *testing.T) {
-	s := newTestServerAPI(t)
-	deviceID := "testdevice-expiry"
-	pushedDir := filepath.Join(s.DataDir, "webp", deviceID, "pushed")
-
-	// Create an anonymous file with timestamp from 48 hours ago
-	oldNanos := time.Now().UnixNano() - 48*int64(time.Hour)
-	oldName := fmt.Sprintf("__%d.webp", oldNanos)
-	if err := os.MkdirAll(pushedDir, 0755); err != nil {
-		t.Fatalf("failed to create pushed dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(pushedDir, oldName), []byte("old"), 0644); err != nil {
-		t.Fatalf("failed to write old file: %v", err)
-	}
-
-	// Save a new anonymous push — triggers async cleanup of the 48-hour-old file
-	if err := s.savePushedImage(deviceID, "", "", []byte("new")); err != nil {
-		t.Fatalf("Failed to save anonymous push: %v", err)
-	}
-
-	// Cleanup runs in a background goroutine; wait for it.
-	assert.Eventually(t, func() bool {
-		entries, err := os.ReadDir(pushedDir)
-		if err != nil {
-			return false
-		}
-		count := 0
-		for _, entry := range entries {
-			if isAnonymousEphemeral(entry.Name()) {
-				count++
-			}
-		}
-		return count == 1
-	}, 2*time.Second, 10*time.Millisecond, "Expected 1 anonymous ephemeral file after async cleanup")
-}
-
-func TestSavePushedImage_CoalesceID_Invalid(t *testing.T) {
-	s := newTestServerAPI(t)
-
-	// Too long
-	longID := strings.Repeat("a", 65)
-	if err := s.savePushedImage("testdevice", "", longID, []byte("x")); err == nil {
-		t.Error("Expected error for coalesceID > 64 chars, got nil")
-	}
-
-	// Invalid characters (slash)
-	if err := s.savePushedImage("testdevice", "", "foo/bar", []byte("x")); err == nil {
-		t.Error("Expected error for coalesceID with slash, got nil")
-	}
-
-	// Invalid characters (dot)
-	if err := s.savePushedImage("testdevice", "", "foo.bar", []byte("x")); err == nil {
-		t.Error("Expected error for coalesceID with dot, got nil")
-	}
-}
-
-func TestSavePushedImage_Anonymous(t *testing.T) {
-	s := newTestServerAPI(t)
-	deviceID := "testdevice2"
-
-	pushedDir := filepath.Join(s.DataDir, "webp", deviceID, "pushed")
-
-	// Save 5 anonymous pushes (no installID, no coalesceID) — all should remain
-	for i := range 5 {
-		imgData := fmt.Appendf(nil, "anonymous image %d", i)
-		if err := s.savePushedImage(deviceID, "", "", imgData); err != nil {
-			t.Fatalf("Failed to save anonymous push %d: %v", i, err)
-		}
-		time.Sleep(1 * time.Millisecond)
-	}
-
-	entries, err := os.ReadDir(pushedDir)
-	if err != nil {
-		t.Fatalf("Failed to read pushed dir: %v", err)
-	}
-
-	// All 5 files should remain (unbounded anonymous queue)
-	// Anonymous: __{timestamp}.webp (only digits between __ and .webp)
-	ephemeralCount := 0
-	for _, entry := range entries {
-		if isAnonymousEphemeral(entry.Name()) {
-			ephemeralCount++
-		}
-	}
-	if ephemeralCount != 5 {
-		t.Errorf("Expected 5 anonymous ephemeral files, got %d: %v", ephemeralCount, entryNames(pushedDir))
-	}
-}
-
 func TestSavePushedImage_InstallID_Replaces(t *testing.T) {
 	s := newTestServerAPI(t)
 	deviceID := "testdevice3"
@@ -1396,7 +1229,7 @@ func TestSavePushedImage_InstallID_Replaces(t *testing.T) {
 	// Save 5 images with same installID
 	for i := range 5 {
 		imgData := fmt.Appendf(nil, "image %d", i)
-		if err := s.savePushedImage(deviceID, "myapp", "", imgData); err != nil {
+		if err := s.savePushedImage(deviceID, "myapp", imgData); err != nil {
 			t.Fatalf("Failed to save pushed image %d: %v", i, err)
 		}
 	}
@@ -1422,14 +1255,4 @@ func entryNames(dir string) []string {
 		names = append(names, e.Name())
 	}
 	return names
-}
-
-// isAnonymousEphemeral returns true for __{timestamp}.webp files
-// (no underscore between the timestamp and .webp).
-func isAnonymousEphemeral(name string) bool {
-	if !strings.HasPrefix(name, "__") || !strings.HasSuffix(name, ".webp") {
-		return false
-	}
-	inner := name[2 : len(name)-5] // strip "__" and ".webp"
-	return !strings.Contains(inner, "_")
 }
