@@ -557,7 +557,7 @@ func (s *Server) deliverPush(ctx context.Context, deviceID, installID string, im
 
 	// Queue a transient one-shot showing, except for a background push targeting an
 	// installation (that only refreshes the rotation image, shown in normal order).
-	if !(background && installID != "") {
+	if !background || installID == "" {
 		s.enqueuePush(deviceID, img, displaySecs, !background && !queue, coalesceID)
 	}
 

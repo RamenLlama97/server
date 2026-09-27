@@ -91,7 +91,7 @@ func TestPushQueue_StateTakeInterrupt(t *testing.T) {
 func TestPushQueue_CapDropsOldest(t *testing.T) {
 	s := newQueueTestServer()
 	dev := "d1"
-	for i := 0; i < maxPushQueueLen+5; i++ {
+	for i := range maxPushQueueLen + 5 {
 		s.enqueuePush(dev, []byte{byte(i)}, i, false, "")
 	}
 	got := drainDwells(s, dev)
