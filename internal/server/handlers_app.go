@@ -765,8 +765,9 @@ func (s *Server) handlePushPreview(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Image not found", http.StatusNotFound)
 			return
 		}
-		// Notify device via Websocket (Broadcaster) - no need to re-save, image already exists
-		s.Broadcaster.Notify(device.ID, imgBytes)
+		// Show immediately via the transient queue (image already persisted on disk).
+		s.enqueuePush(device.ID, imgBytes, 0, true, "")
+		s.Broadcaster.Notify(device.ID, QueueChanged{})
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -803,14 +804,14 @@ func (s *Server) handlePushPreview(w http.ResponseWriter, r *http.Request) {
 		slog.Debug("Preview render message", "message", msg)
 	}
 
-	// Push preview image to device (ephemeral)
-	if err := s.savePushedImage(device.ID, app.Iname, "", imgBytes); err != nil {
+	// Persist the rotation copy, then show immediately via the transient queue.
+	if err := s.savePushedImage(device.ID, app.Iname, imgBytes); err != nil {
 		http.Error(w, "Failed to push preview", http.StatusInternalServerError)
 		return
 	}
 
-	// Notify device via Websocket (Broadcaster)
-	s.Broadcaster.Notify(device.ID, imgBytes)
+	s.enqueuePush(device.ID, imgBytes, 0, true, "")
+	s.Broadcaster.Notify(device.ID, QueueChanged{})
 
 	w.WriteHeader(http.StatusOK)
 }

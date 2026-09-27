@@ -264,6 +264,9 @@ type PushAppData struct {
 	InstallationIDAlt string         `json:"installationId"`
 	CoalesceID        string         `json:"coalesceID"`
 	Background        bool           `json:"background"`
+	// Queue and DisplayTimeSecs mirror the fields on PushData; see that type.
+	Queue           bool `json:"queue"`
+	DisplayTimeSecs int  `json:"display_time_secs"`
 }
 
 func (s *Server) handleListDevices(w http.ResponseWriter, r *http.Request) {
@@ -334,11 +337,9 @@ func (s *Server) handlePushApp(w http.ResponseWriter, r *http.Request) {
 			// recover by providing an appID and config.
 			slog.Warn("Cached pushed image missing, falling through to render", "path", pushedImagePath)
 		} else {
-			if !dataReq.Background {
-				s.Broadcaster.Notify(device.ID, imgBytes)
-			}
-			if err := s.ensurePushedApp(r.Context(), device.ID, cachedID); err != nil {
-				slog.Error("Error adding pushed app", "error", err)
+			if err := s.deliverPush(r.Context(), device.ID, cachedID, imgBytes, dataReq.Background, dataReq.Queue, clampDisplaySecs(dataReq.DisplayTimeSecs), dataReq.CoalesceID); err != nil {
+				http.Error(w, "Failed to deliver push", http.StatusInternalServerError)
+				return
 			}
 			w.WriteHeader(http.StatusOK)
 			if _, err := w.Write([]byte("App pushed.")); err != nil {
@@ -395,24 +396,9 @@ func (s *Server) handlePushApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if installationID != "" {
-		// Ensure app record exists
-		if err := s.ensurePushedApp(r.Context(), device.ID, installationID); err != nil {
-			slog.Error("Failed to ensure pushed app", "error", err)
-		}
-	}
-
-	// Notify device via Websocket only if this is a foreground push
-	sent := false
-	if !dataReq.Background {
-		sent = s.Broadcaster.Notify(device.ID, imgBytes)
-	}
-
-	if !sent || installationID != "" {
-		if err := s.savePushedImage(device.ID, installationID, dataReq.CoalesceID, imgBytes); err != nil {
-			http.Error(w, "Failed to save image", http.StatusInternalServerError)
-			return
-		}
+	if err := s.deliverPush(r.Context(), device.ID, installationID, imgBytes, dataReq.Background, dataReq.Queue, clampDisplaySecs(dataReq.DisplayTimeSecs), dataReq.CoalesceID); err != nil {
+		http.Error(w, "Failed to save image", http.StatusInternalServerError)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -479,6 +465,14 @@ type PushData struct {
 	CoalesceID        string `json:"coalesceID"`
 	Image             string `json:"image"`
 	Background        bool   `json:"background"`
+	// Queue, when true, appends a foreground push behind any image currently
+	// displaying so it plays in its entirety (FIFO). When false (default), a
+	// foreground push supersedes the queue and interrupts immediately.
+	Queue bool `json:"queue"`
+	// DisplayTimeSecs sets how long this one image shows before rotation resumes
+	// (0 => device default). It governs only this transient showing, not the
+	// rotation app's dwell.
+	DisplayTimeSecs int `json:"display_time_secs"`
 }
 
 func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
@@ -501,23 +495,19 @@ func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if installID != "" {
-		if err := s.ensurePushedApp(r.Context(), device.ID, installID); err != nil {
-			slog.Error("Error adding pushed app", "error", err)
+	// Mirror push_app: an empty image is a no-op rather than a zero-length frame
+	// sent to the device.
+	if len(imgBytes) == 0 {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("Empty image, not pushing")); err != nil {
+			slog.Error("Failed to write empty image response", "error", err)
 		}
+		return
 	}
 
-	// Notify device via Websocket only if this is a foreground push
-	sent := false
-	if !dataReq.Background {
-		sent = s.Broadcaster.Notify(device.ID, imgBytes)
-	}
-
-	if !sent || installID != "" {
-		if err := s.savePushedImage(device.ID, installID, dataReq.CoalesceID, imgBytes); err != nil {
-			http.Error(w, fmt.Sprintf("Failed to save image: %v", err), http.StatusInternalServerError)
-			return
-		}
+	if err := s.deliverPush(r.Context(), device.ID, installID, imgBytes, dataReq.Background, dataReq.Queue, clampDisplaySecs(dataReq.DisplayTimeSecs), dataReq.CoalesceID); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to save image: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -527,7 +517,60 @@ func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) savePushedImage(deviceID, installID, coalesceID string, data []byte) error {
+// maxPushDisplaySecs caps an explicit per-image display time. It is generous so a
+// long-lived static image (e.g. a board awaiting the next move) can persist.
+const maxPushDisplaySecs = 86400
+
+// clampDisplaySecs bounds a caller-supplied display_time_secs to [0, maxPushDisplaySecs].
+func clampDisplaySecs(secs int) int {
+	if secs < 0 {
+		return 0
+	}
+	if secs > maxPushDisplaySecs {
+		return maxPushDisplaySecs
+	}
+	return secs
+}
+
+// deliverPush routes a pushed image to a device, honoring the background, queue,
+// display_time_secs, and coalesceID options.
+//
+//   - installID set: the image is persisted as a rotation app (unchanged behavior,
+//     default rotation dwell), and additionally shown once now with displaySecs.
+//   - foreground (background=false): the image is queued for an immediate showing.
+//     queue=false supersedes any pending queue and interrupts the current display;
+//     queue=true appends so it plays in its entirety after the current image.
+//   - background=true: shown on the next natural cycle without interrupting.
+//   - coalesceID (non-interrupt pushes): keeps only the latest pending push sharing
+//     that id, so repeated updates of the same thing don't pile up.
+//
+// displaySecs governs only this transient showing, never the rotation app's dwell.
+func (s *Server) deliverPush(ctx context.Context, deviceID, installID string, img []byte, background, queue bool, displaySecs int, coalesceID string) error {
+	if installID != "" {
+		if err := s.ensurePushedApp(ctx, deviceID, installID); err != nil {
+			slog.Error("Error adding pushed app", "error", err)
+		}
+		if err := s.savePushedImage(deviceID, installID, img); err != nil {
+			return err
+		}
+	}
+
+	// Queue a transient one-shot showing, except for a background push targeting an
+	// installation (that only refreshes the rotation image, shown in normal order).
+	if !(background && installID != "") {
+		s.enqueuePush(deviceID, img, displaySecs, !background && !queue, coalesceID)
+	}
+
+	// Wake the websocket write loop for foreground pushes so it shows the image now.
+	if !background {
+		s.Broadcaster.Notify(deviceID, QueueChanged{})
+	}
+	return nil
+}
+
+// savePushedImage persists the rotation copy of an installation's pushed image.
+// Transient (one-shot) pushes are held in memory; see deliverPush/enqueuePush.
+func (s *Server) savePushedImage(deviceID, installID string, data []byte) error {
 	dir, err := s.ensureDeviceImageDir(deviceID)
 	if err != nil {
 		return fmt.Errorf("failed to get device webp directory: %w", err)
@@ -538,84 +581,12 @@ func (s *Server) savePushedImage(deviceID, installID, coalesceID string, data []
 		return err
 	}
 
-	var filename string
-	if installID != "" {
-		// Image push with installID: stable filename, always replaces
-		filename = installID + ".webp"
-	} else if coalesceID != "" {
-		// Validate coalesceID to prevent path traversal and suffix collisions.
-		if len(coalesceID) > 64 {
-			return fmt.Errorf("coalesceID exceeds maximum length of 64 characters")
-		}
-		for _, r := range coalesceID {
-			isValid := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-'
-			if !isValid {
-				return fmt.Errorf("coalesceID contains invalid characters (only alphanumeric, underscore, and dash allowed)")
-			}
-		}
-
-		// Coalesced push: delete existing file with same coalesceID, then save.
-		// At most 1 pending push per coalesceID.
-		// Filename format: __{timestamp}_{coalesceID}.webp
-		// Extract coalesceID by splitting at the first underscore after the "__" prefix.
-		if entries, err := os.ReadDir(dir); err == nil {
-			for _, entry := range entries {
-				name := entry.Name()
-				if !entry.IsDir() && strings.HasPrefix(name, "__") && strings.HasSuffix(name, ".webp") {
-					inner := name[2 : len(name)-5] // strip "__" and ".webp"
-					if _, fileCoalesceID, found := strings.Cut(inner, "_"); found {
-						if fileCoalesceID == coalesceID {
-							if err := os.Remove(filepath.Join(dir, name)); err != nil {
-								slog.Warn("Failed to remove coalesced push", "name", name, "error", err)
-							}
-						}
-					}
-				}
-			}
-		}
-		filename = fmt.Sprintf("__%d_%s.webp", time.Now().UnixNano(), coalesceID)
-	} else {
-		// Anonymous push: unbounded ephemeral queue
-		filename = fmt.Sprintf("__%d.webp", time.Now().UnixNano())
-	}
-
-	path, err := securejoin.SecureJoin(dir, filename)
+	path, err := securejoin.SecureJoin(dir, installID+".webp")
 	if err != nil {
 		return err
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return err
-	}
-
-	// Clean up anonymous ephemeral files older than 24 hours.
-	// Only runs when saving an anonymous push (coalesced and installID-based
-	// pushes are already bounded). Runs in a background goroutine to avoid
-	// blocking the HTTP response.
-	if installID == "" && coalesceID == "" {
-		go func() {
-			cutoff := time.Now().UnixNano() - 24*int64(time.Hour)
-			if entries, readErr := os.ReadDir(dir); readErr == nil {
-				for _, entry := range entries {
-					name := entry.Name()
-					if !entry.IsDir() && strings.HasPrefix(name, "__") && strings.HasSuffix(name, ".webp") {
-						// Anonymous pushes: __{nanos}.webp (no underscore between __ and .webp suffix)
-						inner := name[2 : len(name)-5]
-						if strings.Contains(inner, "_") {
-							continue // coalesced push, not anonymous
-						}
-						if ts, parseErr := strconv.ParseInt(inner, 10, 64); parseErr == nil && ts < cutoff {
-							if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
-								slog.Warn("Failed to remove expired ephemeral image", "name", name, "error", err)
-							}
-						}
-					}
-				}
-			}
-		}()
-	}
-
-	return nil
+	return os.WriteFile(path, data, 0644)
 }
 
 func (s *Server) ensurePushedApp(ctx context.Context, deviceID, installID string) error {
