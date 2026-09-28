@@ -53,6 +53,11 @@ type Server struct {
 	systemAppsCache      []apps.AppMetadata
 	systemAppsCacheMutex sync.RWMutex
 
+	// pushQueues holds per-device in-memory FIFO queues of transient (one-shot)
+	// pushed images awaiting display. See push_queue.go.
+	pushQueues     map[string]*deviceQueue
+	pushQueueMutex sync.Mutex
+
 	// SchemaCache, when set, allows forcing a one-shot refetch of an app's
 	// cached HTTP responses so dynamic schema data (e.g. dropdown options
 	// fetched in get_schema) can be refreshed before the app's TTL expires.
@@ -108,6 +113,7 @@ func NewServer(db *gorm.DB, cfg *config.Settings) *Server {
 		},
 		PromRegistry: prometheus.DefaultRegisterer,
 		PromGatherer: prometheus.DefaultGatherer,
+		pushQueues:   make(map[string]*deviceQueue),
 	}
 
 	// Load Settings from DB
