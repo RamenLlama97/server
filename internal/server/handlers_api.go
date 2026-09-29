@@ -517,9 +517,10 @@ func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// maxPushDisplaySecs caps an explicit per-image display time. It is generous so a
-// long-lived static image (e.g. a board awaiting the next move) can persist.
-const maxPushDisplaySecs = 86400
+// maxPushDisplaySecs caps an explicit per-image display time. It matches the
+// firmware, which clamps dwell_secs to 1..3600 (main.c), so a larger value would be
+// accepted here but silently shortened on the device.
+const maxPushDisplaySecs = 3600
 
 // clampDisplaySecs bounds a caller-supplied display_time_secs to [0, maxPushDisplaySecs].
 func clampDisplaySecs(secs int) int {

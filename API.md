@@ -283,8 +283,8 @@ Renders an app and pushes it to the device. If `background` is `false`, the devi
 | `installationID` | No | Installation name. If provided and valid, the app path is inferred from the existing installation, and its saved config is used if `config` is omitted. |
 | `config` | No | App configuration. If omitted and `installationID` is provided, uses saved config from that installation. |
 | `background` | No | If `true`, saves the image without interrupting the device (default: `false`) |
-| `queue` | No | If `true`, the foreground push is appended behind the image currently showing so it plays in full (FIFO). If `false` (default), it supersedes any pending pushes and interrupts the current display immediately. |
-| `display_time_secs` | No | Minimum seconds to show this one image before resuming rotation (default `0` = device default). Firmware rounds up to a whole number of animation loops, so e.g. `1` shows exactly one full cycle. Affects only this transient showing, never the rotation app's dwell. |
+| `queue` | No | If `true`, the foreground push is appended (FIFO) behind any pushed image currently on screen or pending, so a pushed image already playing is never cut short; if the device is showing a rotation or default image, the push preempts it right away. If `false` (default), it supersedes any pending pushes and interrupts the current display immediately. |
+| `display_time_secs` | No | Minimum seconds to show this one image before resuming rotation (default `0` = device default). Firmware rounds up to a whole number of animation loops, so e.g. `1` shows exactly one full cycle. Affects only this transient showing, never the rotation app's dwell. Capped at `3600`, the firmware's maximum dwell. |
 | `coalesceID` | No | Optional key for `queue:true` pushes: a new push with the same `coalesceID` drops any earlier pending push sharing it, keeping only the latest (e.g. repeated updates of the same view). |
 
 **Response:** `200 OK` — `"App pushed."`
@@ -332,8 +332,8 @@ Pushes a base64-encoded WebP image directly to the device.
 | `installationID` | No | Identifier for the pushed image |
 | `image` | Yes | Base64-encoded WebP image bytes |
 | `background` | No | If `true`, saves without interrupting (default: `false`) |
-| `queue` | No | If `true`, the foreground push is appended behind the image currently showing so it plays in full (FIFO). If `false` (default), it supersedes any pending pushes and interrupts the current display immediately. |
-| `display_time_secs` | No | Minimum seconds to show this one image before resuming rotation (default `0` = device default). Firmware rounds up to a whole number of animation loops, so e.g. `1` shows exactly one full cycle. Affects only this transient showing, never the rotation app's dwell. |
+| `queue` | No | If `true`, the foreground push is appended (FIFO) behind any pushed image currently on screen or pending, so a pushed image already playing is never cut short; if the device is showing a rotation or default image, the push preempts it right away. If `false` (default), it supersedes any pending pushes and interrupts the current display immediately. |
+| `display_time_secs` | No | Minimum seconds to show this one image before resuming rotation (default `0` = device default). Firmware rounds up to a whole number of animation loops, so e.g. `1` shows exactly one full cycle. Affects only this transient showing, never the rotation app's dwell. Capped at `3600`, the firmware's maximum dwell. |
 | `coalesceID` | No | Optional key for `queue:true` pushes: a new push with the same `coalesceID` drops any earlier pending push sharing it, keeping only the latest. |
 
 **Response:** `200 OK` — `"WebP received."`

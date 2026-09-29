@@ -21,6 +21,106 @@ const (
 	maxDisplayingAckTimeoutSeconds = 600
 )
 
+// queueChangeAction is how the write loop reacts when a device's transient push
+// queue changes.
+type queueChangeAction int
+
+const (
+	// queueChangeIgnore leaves the display alone; the queue drains after the next ACK.
+	queueChangeIgnore queueChangeAction = iota
+	// queueChangePreempt sends the queue head now with "immediate", interrupting the display.
+	queueChangePreempt
+	// queueChangeReplace sends the queue head without "immediate". It replaces the
+	// image the device has buffered next, and plays once the current image finishes.
+	queueChangeReplace
+)
+
+func (a queueChangeAction) String() string {
+	switch a {
+	case queueChangeIgnore:
+		return "ignore"
+	case queueChangePreempt:
+		return "preempt"
+	case queueChangeReplace:
+		return "replace-buffered"
+	default:
+		return fmt.Sprintf("queueChangeAction(%d)", int(a))
+	}
+}
+
+// decideQueueChange picks how the write loop reacts to a push queue change.
+//
+// The loop sends one image ahead of the display: once the device ACKs that image N
+// is displaying, the loop sends image N+1, which the firmware buffers until N has
+// finished its dwell. The firmware has a single buffer slot, so a newer image
+// replaces a buffered one that has not started. The image on screen
+// (onScreenIsQueued) and the image sent and awaiting its ACK (sentIsQueued) can
+// therefore differ, and a queue:true push must be judged against what is on screen:
+//
+//   - interrupt (a queue:false push arrived): preempt whatever is showing.
+//   - nothing pending, or the sent image is itself a transient push: ignore; the
+//     queue drains in order after that image's ACK.
+//   - a transient push is on screen with a rotation image buffered behind it:
+//     replace the buffered image without "immediate", so the push on screen plays
+//     to the end and the queued push follows it.
+//   - rotation/default is on screen: preempt it right away.
+func decideQueueChange(interrupt, pending, sentIsQueued, onScreenIsQueued bool) queueChangeAction {
+	switch {
+	case interrupt:
+		return queueChangePreempt
+	case !pending || sentIsQueued:
+		return queueChangeIgnore
+	case onScreenIsQueued:
+		return queueChangeReplace
+	default:
+		return queueChangePreempt
+	}
+}
+
+// ackTracker matches the device's "displaying" ACKs to the image the write loop
+// just sent. The firmware numbers every image it buffers with an increasing
+// counter, reported in {"queued":N} and later {"displaying":N}. An image sent now
+// gets a counter above every counter already seen, so a "displaying" with a lower
+// counter is a late ACK for an older image (e.g. one that started just as an
+// interrupt was sent) and must not be taken as the new image being on screen.
+type ackTracker struct {
+	maxSeen int // highest counter seen in any queued/displaying message; -1 if none yet
+	minAck  int // lowest counter accepted as the ACK for the image just sent
+}
+
+func newAckTracker() ackTracker {
+	return ackTracker{maxSeen: -1}
+}
+
+// imageSent records that a new image was just written to the device.
+func (t *ackTracker) imageSent() {
+	t.minAck = t.maxSeen + 1
+}
+
+// observe records a device message and reports whether it is the "displaying" ACK
+// for the image just sent. {"queued":N} notices only update the counters.
+func (t *ackTracker) observe(msg WSMessage) bool {
+	if msg.Queued != nil {
+		t.see(*msg.Queued)
+	}
+	displaying := msg.Displaying
+	if displaying == nil {
+		displaying = msg.Counter // alternative format: {"status":"displaying","counter":N}
+	}
+	if displaying == nil {
+		return false
+	}
+	isAck := *displaying >= t.minAck
+	t.see(*displaying)
+	return isAck
+}
+
+func (t *ackTracker) see(counter int) {
+	if counter > t.maxSeen {
+		t.maxSeen = counter
+	}
+}
+
 type WSMessage struct {
 	Queued     *int        `json:"queued"`
 	Displaying *int        `json:"displaying"`
@@ -208,7 +308,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if msg.Displaying != nil || msg.Counter != nil {
+			// Forward display ACKs and "queued" notices; the write loop uses the
+			// counters to match an ACK to the image it just sent.
+			if msg.Displaying != nil || msg.Counter != nil || msg.Queued != nil {
 				select {
 				case ackCh <- msg:
 				default:
@@ -226,6 +328,10 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 	device := *initialDevice
 	lastSentBrightness := -1
 	sendImmediate := false
+	// Whether the image the device last ACKed as displaying is a transient push.
+	// Not the same as the image last sent: see decideQueueChange.
+	onScreenIsQueued := false
+	acks := newAckTracker()
 
 	for {
 		select {
@@ -270,8 +376,9 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 		}
 
 		// A transient (queued) pushed image has an empty Iname. A queue:true append
-		// must not cut such an image short, but a queue:false (supersede) push may.
-		currentIsQueued := app != nil && app.Pushed && app.Iname == ""
+		// must not cut such an image short once it is on screen, but a queue:false
+		// (supersede) push may. See decideQueueChange.
+		sentIsQueued := app != nil && app.Pushed && app.Iname == ""
 
 		dwell := device.GetEffectiveDwellTime(app)
 
@@ -293,6 +400,7 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 			return
 		}
 
+		sentImmediate := sendImmediate
 		if sendImmediate {
 			if err := conn.WriteJSON(map[string]bool{"immediate": true}); err != nil {
 				slog.Error("Failed to write immediate WS message", "error", err)
@@ -300,6 +408,13 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 			}
 			sendImmediate = false
 		}
+		acks.imageSent()
+		if device.Info.ProtocolVersion == nil {
+			// Legacy firmware sends no ACKs; treat the image as on screen once sent.
+			onScreenIsQueued = sentIsQueued
+		}
+		slog.Debug("Sent image to device", "device", device.ID, "transient_push", sentIsQueued,
+			"immediate", sentImmediate, "dwell_secs", dwell, "min_ack_counter", acks.minAck)
 
 		// 3. Wait for displaying ACK, safety/legacy timeout, or interrupt.
 		// v1+ firmware sends displaying when the image is on screen (including long
@@ -320,26 +435,30 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 		for waiting {
 			select {
 			case msg := <-ackCh:
-				// Received ACK
-				if msg.Displaying != nil || msg.Counter != nil {
-					// The firmware sends a sequential counter (1, 2, 3...) in the 'displaying' field,
-					// not the App ID we sent. Since we can't verify which specific app is displaying,
-					// we accept any ACK as confirmation that the device received and processed our message.
-					waiting = false
-
-					// Update DisplayingApp confirmation in DB (skip transient pushed
-					// images, which use a synthetic app with an empty Iname).
-					if app != nil && app.Iname != "" {
-						slog.Debug("Received ACK, updating DisplayingApp", "app", app.Iname, "device", device.ID)
-						// Only now do we update the database that the device is truly displaying this app.
-						if _, err := gorm.G[data.Device](s.DB).Where("id = ?", device.ID).Update(ctx, "displaying_app", app.Iname); err != nil {
-							slog.Error("Failed to update displaying_app", "device", device.ID, "error", err)
-						}
-						// Notify Dashboard
-						s.notifyDashboard(user.Username, WSEvent{Type: "image_updated", DeviceID: device.ID})
-					} else {
-						slog.Debug("Received ACK for default or pushed image (no app context)", "device", device.ID)
+				// The firmware reports a sequential image counter, not the app we sent, so
+				// accept a "displaying" only if its counter belongs to the image just sent.
+				if !acks.observe(msg) {
+					if msg.Displaying != nil || msg.Counter != nil {
+						slog.Debug("Ignoring displaying ACK for an older image", "device", device.ID,
+							"min_ack_counter", acks.minAck)
 					}
+					continue
+				}
+				waiting = false
+				onScreenIsQueued = sentIsQueued
+
+				// Update DisplayingApp confirmation in DB (skip transient pushed
+				// images, which use a synthetic app with an empty Iname).
+				if app != nil && app.Iname != "" {
+					slog.Debug("Received ACK, updating DisplayingApp", "app", app.Iname, "device", device.ID)
+					// Only now do we update the database that the device is truly displaying this app.
+					if _, err := gorm.G[data.Device](s.DB).Where("id = ?", device.ID).Update(ctx, "displaying_app", app.Iname); err != nil {
+						slog.Error("Failed to update displaying_app", "device", device.ID, "error", err)
+					}
+					// Notify Dashboard
+					s.notifyDashboard(user.Username, WSEvent{Type: "image_updated", DeviceID: device.ID})
+				} else {
+					slog.Debug("Received ACK for default or pushed image (no app context)", "device", device.ID)
 				}
 			case val := <-broadcastCh:
 				// Update available (Reload device first)
@@ -360,15 +479,17 @@ func (s *Server) wsWriteLoop(ctx context.Context, conn *websocket.Conn, initialD
 					// Don't interrupt the current app for settings changes, unless it's a reboot (which the device handles)
 					continue
 				case QueueChanged:
-					// The transient push queue changed. Interrupt the current display when a
-					// supersede (queue:false) push arrived, or when an image is pending and the
-					// current display is rotation/default (preempt it). A queued image already
-					// showing is left to finish; the next loop iteration drains the next item.
+					// The transient push queue changed. Decide against what is on screen, not
+					// just what was last sent: the loop sends one image ahead of the display.
 					interruptFlag, pending := s.pushQueueState(device.ID, true)
-					if interruptFlag || (!currentIsQueued && pending) {
+					action := decideQueueChange(interruptFlag, pending, sentIsQueued, onScreenIsQueued)
+					slog.Debug("Push queue changed", "device", device.ID, "interrupt", interruptFlag,
+						"pending", pending, "sent_transient_push", sentIsQueued,
+						"on_screen_transient_push", onScreenIsQueued, "action", action)
+					if action != queueChangeIgnore {
 						interrupted = true
 						waiting = false
-						sendImmediate = true
+						sendImmediate = action == queueChangePreempt
 					}
 				default:
 					// State Change: Update Brightness immediately, but don't interrupt current app

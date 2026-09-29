@@ -111,3 +111,22 @@ The server uses a sophisticated acknowledgment system to manage the flow of imag
     In these cases, the server immediately renders and sends the new, high-priority image.
 
 This ensures that the device is always showing the most up-to-date content while accommodating different firmware versions and allowing for real-time updates.
+
+### Look-ahead sending and the firmware's buffer
+
+*   **One image ahead.** When the device ACKs that image N is `displaying`, the server immediately sends image N+1. The firmware buffers it and starts it only when N has finished its dwell (whole animation loops), or right away if the server follows it with `immediate`. So the image **on screen** and the image **last sent** are usually different.
+*   **Single buffer slot.** The firmware keeps at most one buffered image: a newly received image replaces a buffered one that has not started (`gfx_update` in the firmware, "Dropping queued image"). Only one `queued` counter is ever consumed.
+*   **Counters.** The firmware numbers every buffered image with an increasing counter, sent in both `queued` and `displaying`. The server accepts a `displaying` as the ACK for the image it just sent only if the counter is newer than every counter it had already seen when it sent that image. A late `displaying` for an older image (e.g. one that started just as an interrupt was sent) is ignored.
+
+### Transient push queue (`queue` / `display_time_secs`)
+
+When the transient push queue changes, the write loop compares the image **on screen** (last accepted ACK) with the image **sent and awaiting its ACK**:
+
+| Situation | Action |
+|---|---|
+| A `queue:false` push arrived | Send it with `immediate`, interrupting whatever is showing. |
+| The image awaiting its ACK is itself a pushed image | Nothing; the queue drains in order after that ACK. |
+| A pushed image is on screen and a rotation image is buffered behind it | Send the queued push **without** `immediate`. It replaces the buffered rotation image, and plays once the pushed image on screen finishes. |
+| A rotation or default image is on screen | Send the queued push with `immediate` (preempt rotation). |
+
+Because a replaced rotation image was already counted by rotation (`LastAppIndex`), rotation skips it once, as after any interrupt.
